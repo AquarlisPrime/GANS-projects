@@ -268,22 +268,43 @@ class MinibatchStdDev(nn.Module):
         return torch.cat([x, std_feature], 1)
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
+
+# Helper to create blocks with optional attention
+def _make_block(in_ch, out_ch, use_attention=False):
+    if use_attention:
+        return nn.Sequential(
+            ResBlockDown(in_ch, out_ch),
+            PerformerSelfAttention2D(out_ch)
+        )
+    else:
+        return ResBlockDown(in_ch, out_ch)
+
 class ProgressiveDiscriminator(nn.Module):
     def __init__(self):
         super().__init__()
         channels = [4, 8, 16, 32, 64, 128, 256, 512]
+
+        # Selectively apply Performer attention at deeper layers
         self.blocks = nn.ModuleList([
-            ResBlockDown(channels[0], channels[1]),
-            ResBlockDown(channels[1], channels[2]),
-            nn.Sequential(ResBlockDown(channels[2], channels[3]), PerformerSelfAttention2D(channels[3])),
-            ResBlockDown(channels[3], channels[4]),
-            nn.Sequential(ResBlockDown(channels[4], channels[5]), PerformerSelfAttention2D(channels[5])),
-            ResBlockDown(channels[5], channels[6]),
-            ResBlockDown(channels[6], channels[7]),
+            _make_block(channels[0], channels[1]),
+            _make_block(channels[1], channels[2]),
+            _make_block(channels[2], channels[3], use_attention=True),
+            _make_block(channels[3], channels[4]),
+            _make_block(channels[4], channels[5], use_attention=True),
+            _make_block(channels[5], channels[6]),
+            _make_block(channels[6], channels[7]),
         ])
+
+        # From RGB to feature channels (with spectral norm)
         self.from_rgb = nn.ModuleList([
-            nn.Conv2d(1, c, kernel_size=1) for c in channels
+            spectral_norm(nn.Conv2d(1, c, kernel_size=1)) for c in channels
         ])
+
+        # Final layers: Minibatch StdDev + final conv
         self.final = nn.Sequential(
             MinibatchStdDev(),
             spectral_norm(nn.Conv2d(513, 1, kernel_size=4)),
@@ -295,7 +316,9 @@ class ProgressiveDiscriminator(nn.Module):
             out = self.from_rgb[step](x)
             out = self.blocks[step](out)
         else:
-            downscaled = F.avg_pool2d(x, 2)
+            # Downscale previous resolution (skip if input is already very small)
+            downscaled = F.avg_pool2d(x, 2) if x.size(2) > 1 and x.size(3) > 1 else x
+
             out_prev = self.from_rgb[step - 1](downscaled)
             out_prev = self.blocks[step - 1](out_prev)
 
@@ -304,10 +327,12 @@ class ProgressiveDiscriminator(nn.Module):
 
             out = fade_in(alpha, out_prev, out)
 
-        for i in range(step + 1, len(self.blocks)):
-            out = self.blocks[i](out)
+        # Continue through the remaining blocks
+        for block in self.blocks[step + 1:]:
+            out = block(out)
 
         return self.final(out)
+
         
 !pip install -q wandb
 import wandb
@@ -320,11 +345,13 @@ import torch.optim as optim
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from torchmetrics.image.fid import FrechetInceptionDistance
-import wandb
 import numpy as np
 import cv2
 from PIL import Image
 import tifffile as tiff
+from tqdm import tqdm
+from torch.amp import autocast
+from torchvision.utils import make_grid
 
 # ✅ Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -396,7 +423,6 @@ data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_worke
 model_G = ProgressiveGenerator(latent_dim=latent_dim).to(device)
 model_D = ProgressiveDiscriminator().to(device)
 
-
 # ✅ Optimizers
 optimizer_G = optim.Adam(model_G.parameters(), lr=learning_rate, betas=(0.0, 0.99))
 optimizer_D = optim.Adam(model_D.parameters(), lr=learning_rate, betas=(0.0, 0.99))
@@ -426,6 +452,7 @@ wandb.init(
     }
 )
 
+
 from torchvision import transforms
 from torch.utils.data import DataLoader
 
@@ -448,28 +475,34 @@ def get_combined_dataloader(res, batch_size):
     )
 
     return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    import torch
-from tqdm import tqdm
-import wandb
-import torch.nn.functional as F
-from torchvision.utils import make_grid
-from torch.amp import autocast
 
+def get_combined_dataloader(res, batch_size):
+    transform = transforms.Compose([
+        transforms.Resize((res, res)),
+        transforms.CenterCrop(res),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5])
+    ])
 
-# ✅ Set final target image resolution
-image_size = 256  # Change to 128, 512, etc. as needed
+    dataset = CombinedMicrostructureDataset(
+        root_dirs=[
+            "/kaggle/input/struct-1-zip/particles/particles/images",
+            "/kaggle/input/struct-1-zip/uhcs/uhcs/images"
+        ],
+        transform=transform
+    )
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
 
 # ✅ Training Hyperparams
-latent_dim = 128  # instead of 100
 total_steps = int(torch.log2(torch.tensor(image_size // 4))) + 1
 epochs_per_step = {i: 10 if i < total_steps - 1 else 30 for i in range(total_steps)}  # more at higher res
 fid_eval_interval = 1  # Evaluate every N epochs
 samples_to_generate = 16
 fixed_noise = torch.randn(samples_to_generate, latent_dim, 1, 1, device=device)
-
 
 # ✅ Loss functions
 def gradient_penalty(D, real, fake, step, alpha):
@@ -559,7 +592,7 @@ for step in range(total_steps):
                 with torch.cuda.amp.autocast():
                     for _ in range(5):
                         z_fid = torch.randn(batch_size, latent_dim, 1, 1, device=device)
-                        fake_images = ema.shadow(z_fid, step, alpha)
+                        fake_images = ema.shadow(z_fid, step, alpha)  # Update: EMA for fake image generation
                         fid_metric.update(fake_images, real=False)
 
                         try:
